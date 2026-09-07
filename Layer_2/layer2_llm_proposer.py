@@ -39,9 +39,9 @@ from Layer_1.layer1_branin_bo import branin, BOUNDS, TRUE_MIN, run_bo
 load_dotenv()  # reads .env in the current directory (or a parent) into os.environ
 
 SEED = 42
-MODEL = "qwen/Qwen3.6-27B"  # served via Groq -- currently a Groq preview model, not GA
+MODEL = "openai/gpt-oss-120b"  # served via Groq -- currently a Groq preview model, not GA
 MAX_TOKENS = 500
-REASONING_EFFORT = "default"  # qwen3.6-27b only accepts "none" (off) or "default" (thinking mode on)
+REASONING_EFFORT = "medium"  
 
 SYSTEM_PROMPT = """You are proposing the next point to evaluate in a black-box \
 optimization problem. The domain is x1 in [-5, 10] and x2 in [0, 15]. \
@@ -268,7 +268,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="test the harness with no API calls")
     parser.add_argument("--permute", action="store_true", help="run the permuted-feedback sanity check")
-    parser.add_argument("--n-iter", type=int, default=20)
+    parser.add_argument("--n-iter", type=int, default=50)
     parser.add_argument("--n-init", type=int, default=5)
     parser.add_argument("--replot", metavar="RESULTS_JSON",
                         help="rebuild the plot from a saved results file instead of running "

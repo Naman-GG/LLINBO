@@ -234,7 +234,7 @@ def make_plot(best_hybrid, best_classical, n_init, llm_win_rate, chance, out_pat
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--n-iter", type=int, default=20)
+    parser.add_argument("--n-iter", type=int, default=50)
     parser.add_argument("--n-init", type=int, default=5)
     parser.add_argument("--n-candidates", type=int, default=N_CANDIDATES)
     parser.add_argument("--n-random-candidates", type=int, default=20,
