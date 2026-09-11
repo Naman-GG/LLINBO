@@ -1,24 +1,10 @@
 """
-Layer 2 -- LLM replaces the GP + Expected Improvement step from Layer 1.
+Layer 2: same loop as Layer 1, but the LLM proposes the next point instead of
+GP + EI. --permute is the sanity check from "LLMs for Bayesian Optimization in
+Scientific Domains: Are We There Yet?" - scramble the y-values the LLM sees and
+its trajectory should fall apart.
 
-Same loop as Layer 1:
-    propose next point -> evaluate real objective -> add to history -> repeat
-The only thing that changes is *who* proposes: instead of a fitted GP +
-EI acquisition function, we hand the LLM the history as text and ask it
-to reason about what to try next.
-
-Includes the permuted-feedback sanity check from "LLMs for Bayesian
-Optimization in Scientific Domains: Are We There Yet?" -- if the LLM is
-actually reasoning from feedback, scrambling the y-values it sees should
-visibly hurt its trajectory. If its behavior barely changes, that's
-evidence it isn't really using the feedback at all.
-
-Usage:
-    Create a .env file next to this script containing:
-        GROQ_API_KEY=your_key_here
-    python3 layer2_llm_proposer.py                # real run
-    python3 layer2_llm_proposer.py --dry-run       # test the harness, no API calls, no key needed
-    python3 layer2_llm_proposer.py --permute       # sanity-check run
+Needs GROQ_API_KEY in .env. --dry-run skips the API entirely.
 """
 
 import argparse
@@ -28,7 +14,7 @@ import re
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # BayOAgent/ (project root)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -36,7 +22,7 @@ from dotenv import load_dotenv
 
 from Layer_1.layer1_branin_bo import branin, BOUNDS, TRUE_MIN, run_bo
 
-load_dotenv()  # reads .env in the current directory (or a parent) into os.environ
+load_dotenv()
 
 SEED = 42
 MODEL = "openai/gpt-oss-120b"  # served via Groq -- currently a Groq preview model, not GA
@@ -60,50 +46,37 @@ def format_history(history):
     return "\n".join(lines)
 
 
+def _match_brace(text, start):
+    depth = 0
+    for j in range(start, len(text)):
+        depth += (text[j] == "{") - (text[j] == "}")
+        if depth == 0:
+            return j + 1
+    return None
+
+
 def extract_json_objects(text):
-    """Find ALL balanced {...} objects in text, respecting quoted strings so
-    a brace inside a string value doesn't get swallowed into a match.
-    There can legitimately be more than one -- e.g. a reasoning model that
-    echoes the format instructions before actually answering."""
-    objects = []
-    i = 0
-    while True:
-        start = text.find("{", i)
-        if start == -1:
-            break
-        depth = 0
-        in_string = False
-        escape = False
-        end = None
-        for j in range(start, len(text)):
-            ch = text[j]
-            if in_string:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_string = False
-            else:
-                if ch == '"':
-                    in_string = True
-                elif ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        end = j
-                        break
-        if end is None:
-            break  # unbalanced from here on -- stop scanning
-        objects.append(text[start:end + 1])
-        i = end + 1
-    return objects
+    """Every {...} block in text, in order. There can be more than one: a
+    reasoning model often echoes the schema before it answers. The stdlib
+    scanner does the real work; the brace count is only there to catch
+    Python-style dicts with single quotes, which it refuses."""
+    decoder = json.JSONDecoder()
+    blocks, i = [], 0
+    while (start := text.find("{", i)) != -1:
+        try:
+            _, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            end = _match_brace(text, start)
+            if end is None:
+                i = start + 1
+                continue
+        blocks.append(text[start:end])
+        i = end
+    return blocks
 
 
 def _try_parse_one(candidate):
-    """Parse a single candidate as JSON, falling back to a lenient
-    Python-literal parse for single-quoted/Python-dict-style output."""
+    """JSON first, then a lenient Python-literal parse for single-quoted output."""
     try:
         return json.loads(candidate)
     except json.JSONDecodeError:
@@ -114,11 +87,9 @@ def _try_parse_one(candidate):
 
 
 def parse_llm_response(text):
-    """Pull the JSON object out of the response, tolerating markdown fences,
-    trailing commentary, and mild single-quoted/Python-dict-style slips.
-    Tries every balanced {...} block found, from LAST to FIRST, since a
-    model's real final answer -- if it echoes the schema or thinks aloud
-    first -- almost always comes after any preamble, not before it."""
+    """Pull (x1, x2, reasoning) out of the response, tolerating markdown fences and
+    trailing commentary. Blocks are tried last-to-first: if the model echoes the
+    schema or thinks aloud, the real answer comes at the end."""
     candidates = extract_json_objects(text)
     if not candidates:
         raise ValueError(f"no balanced JSON object found in response: {text!r}")
@@ -144,7 +115,7 @@ def clip_to_bounds(x1, x2):
 
 
 def propose_next_point_llm(history, client):
-    """Real API call. One retry if the response doesn't parse as JSON."""
+    """One retry if the response doesn't parse, then a random point."""
     prompt = f"History so far:\n{format_history(history)}\n\nPropose the next point."
     for attempt in range(2):
         kwargs = dict(
@@ -169,17 +140,15 @@ def propose_next_point_llm(history, client):
                     f"({e}). Respond with ONLY the JSON object, nothing else."
                 )
                 continue
-            # Naive fallback after one failed retry -- deliberately not a real
-            # recovery strategy. This gap is exactly what Layer 3/the reliability
-            # layer project is meant to close. Seeded off the history length so a
-            # run that hits fallbacks is still reproducible.
+            # Crude on purpose: closing this gap properly is what Layer 3 is for.
+            # Seeded off history length to keep a run with fallbacks reproducible.
             rng = np.random.default_rng(SEED + 100_000 + len(history))
             fallback = tuple(rng.uniform(BOUNDS[:, 0], BOUNDS[:, 1]))
             return clip_to_bounds(*fallback), "FALLBACK: unparseable response twice", text
 
 
 def propose_next_point_dry_run(history, rng):
-    """Stand-in for the LLM call so the harness can be tested with no API key."""
+    """Stand-in for the LLM call, so the harness runs without an API key."""
     x1, x2 = rng.uniform(BOUNDS[:, 0], BOUNDS[:, 1])
     return clip_to_bounds(x1, x2), "dry-run stub: random point", ""
 
@@ -232,8 +201,7 @@ def run_llm_bo(n_init, n_iter, permute_feedback=False, dry_run=False):
 
 
 def make_plot(best_llm, best_classical, n_init, permute, n_fallback, out_path):
-    """Convergence plot. Kept separate from the run so a saved results file can be
-    re-plotted without spending API calls (see --replot)."""
+    """Separate from the run so --replot can rebuild it without API calls."""
     fig, ax = plt.subplots(figsize=(8, 5.5))
     iters = np.arange(len(best_llm))
     label = "LLM proposer (permuted feedback)" if permute else "LLM proposer"
@@ -241,7 +209,7 @@ def make_plot(best_llm, best_classical, n_init, permute, n_fallback, out_path):
     ax.plot(np.arange(len(best_classical)), best_classical, marker="s",
             label="classical GP + EI (Layer 1)", color="tab:blue")
     ax.axhline(TRUE_MIN, color="gray", linestyle="--", label=f"true global min ({TRUE_MIN:.3f})")
-    # index 0 is the best over ALL n_init random points -- the proposer takes over at 1.
+    # index 0 already covers the whole random design
     ax.axvline(0.5, color="black", linestyle=":", alpha=0.5)
     ax.set_xlabel(f"iteration (0 = best of the {n_init} random init points, "
                   f"1+ = one proposal each)")
@@ -249,9 +217,8 @@ def make_plot(best_llm, best_classical, n_init, permute, n_fallback, out_path):
 
     title = "LLM proposer vs classical BO on Branin" + (" -- permuted feedback" if permute else "")
     if n_fallback:
-        # Unparseable responses fell back to uniform random points. Those iterations
-        # are NOT the LLM reasoning, so the curve is part random search -- say so on
-        # the figure, otherwise the permuted result reads stronger than it is.
+        # Those iterations were random points, not the LLM. Without this on the
+        # figure the permuted result looks stronger than it is.
         n_total = len(best_llm) - 1
         title += (f"\ncaveat: {n_fallback}/{n_total} proposals were random fallbacks "
                   f"(unparseable LLM response)")

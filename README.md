@@ -50,7 +50,7 @@ This is the baseline every later layer is measured against.
 ## Layer 2 — LLM instead of GP + EI
 
 Same loop, but the GP and the EI math are removed. The history is formatted as
-text, handed to an LLM (`qwen/Qwen3.6-27B` via Groq), and the LLM's proposed
+text, handed to an LLM (`openai/gpt-oss-120b` via Groq), and the LLM's proposed
 point is used directly.
 
 ![Layer 2](Layer_2/layer2_comparison.png)

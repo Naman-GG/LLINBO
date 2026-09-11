@@ -1,28 +1,9 @@
 """
-Layer 3 -- Hybrid: LLM proposes candidate points, a real GP + Expected
-Improvement acquisition function picks among them (LLAMBO-style).
+Layer 3, LLAMBO-style hybrid: the LLM proposes candidate points, real EI picks
+among them. The LLM narrows down where to look and never gets the final say.
 
-Unlike Layer 2 (the LLM's choice IS the next point, trusted directly), here
-the LLM only narrows down WHERE to look. The actual "which point wins"
-decision is made by the same principled EI math as Layer 1. This tests
-whether LLM-generated candidates give EI a better starting point than a
-blind random/grid search would -- without ever trusting the LLM's judgment
-on its own.
-
-Loop per iteration:
-    1. Fit a GP on the history so far (same as Layer 1)
-    2. Ask the LLM for N_CANDIDATES diverse candidate points
-    3. Add a pool of random filler candidates too, so EI always has
-       options even if every LLM candidate is unusable
-    4. Score ALL candidates (LLM + random) with real EI over the fitted GP
-    5. Evaluate the real objective at whichever candidate scored highest
-    6. Log whether EI picked an LLM candidate or a random filler --
-       this win rate is the actual measure of whether the LLM helped
-
-Usage:
-    python3 layer3_hybrid.py
-    python3 layer3_hybrid.py --dry-run
-    python3 layer3_hybrid.py --n-candidates 5
+Random filler candidates go into the same pool, so how often an LLM candidate
+beats all of them is a built-in control on whether the LLM is helping at all.
 """
 
 import argparse
@@ -30,7 +11,7 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # BayOAgent/ (project root)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -39,7 +20,9 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, ConstantKernel, WhiteKernel
 
 from Layer_1.layer1_branin_bo import branin, BOUNDS, TRUE_MIN, expected_improvement, run_bo
-from Layer_2.layer2_llm_proposer import extract_json_objects, _try_parse_one, format_history
+from Layer_2.layer2_llm_proposer import (
+    extract_json_objects, _try_parse_one, format_history, clip_to_bounds,
+)
 
 load_dotenv()
 
@@ -51,9 +34,8 @@ N_CANDIDATES = 5  # default number of candidate points the LLM proposes per iter
 
 
 def build_system_prompt(n_candidates):
-    """Built per-call rather than once at import, so --n-candidates actually reaches
-    the model. (A module-level f-string would freeze the count at the default and
-    silently disagree with the user message.)"""
+    """Built per call: a module-level f-string would freeze the count at the
+    default and then disagree with what the user message asks for."""
     return f"""You are proposing CANDIDATE points to evaluate next in a black-box \
 optimization problem. The domain is x1 in [-5, 10] and x2 in [0, 15]. \
 LOWER values are BETTER (we are minimizing). Given the history of points \
@@ -76,9 +58,8 @@ def make_gp():
 
 
 def parse_candidates_response(text):
-    """Pull {"candidates": [...]} out of the response, reusing Layer 2's
-    robust multi-block extraction (tries every balanced {...} found, last
-    to first, so an echoed schema placeholder doesn't win over a real answer)."""
+    """Pull {"candidates": [...]} out of the response. Same last-to-first block
+    order as Layer 2, so an echoed schema doesn't beat the real answer."""
     blocks = extract_json_objects(text)
     if not blocks:
         raise ValueError(f"no balanced JSON object found in response: {text!r}")
@@ -103,15 +84,8 @@ def parse_candidates_response(text):
     )
 
 
-def clip_to_bounds(x1, x2):
-    x1c = float(np.clip(x1, *BOUNDS[0]))
-    x2c = float(np.clip(x2, *BOUNDS[1]))
-    return x1c, x2c
-
-
 def propose_candidates_llm(history, client, n_candidates=N_CANDIDATES):
-    """Real API call asking for n_candidates points. One retry if unparseable,
-    then falls back to n_candidates random points (clearly tagged as such)."""
+    """One retry if unparseable, then n_candidates random points, tagged as such."""
     prompt = f"History so far:\n{format_history(history)}\n\nPropose {n_candidates} candidate points."
     for attempt in range(2):
         kwargs = dict(
@@ -136,7 +110,7 @@ def propose_candidates_llm(history, client, n_candidates=N_CANDIDATES):
                     f"Respond with ONLY the JSON object, nothing else."
                 )
                 continue
-            # Seeded off the history length so a run that hits fallbacks stays reproducible.
+            # seeded off history length to stay reproducible
             rng = np.random.default_rng(SEED + 100_000 + len(history))
             fallback = [
                 (*clip_to_bounds(*p), "FALLBACK: unparseable response twice")
@@ -205,21 +179,19 @@ def run_hybrid_bo(n_init, n_iter, dry_run=False, n_random_candidates=20,
 
 
 def make_plot(best_hybrid, best_classical, n_init, llm_win_rate, chance, out_path):
-    """Kept separate from the run so a saved results file can be re-plotted without
-    spending API calls (see --replot)."""
+    """Separate from the run so --replot can rebuild it without API calls."""
     fig, ax = plt.subplots(figsize=(8, 5.5))
     ax.plot(np.arange(len(best_hybrid)), best_hybrid, marker="o",
             label="hybrid (LLM candidates + real EI)", color="tab:green")
     ax.plot(np.arange(len(best_classical)), best_classical, marker="s",
             label="classical GP + EI (Layer 1)", color="tab:blue")
     ax.axhline(TRUE_MIN, color="gray", linestyle="--", label=f"true global min ({TRUE_MIN:.3f})")
-    # index 0 is the best over ALL n_init random points -- the hybrid takes over at 1.
+    # index 0 already covers the whole random design
     ax.axvline(0.5, color="black", linestyle=":", alpha=0.5)
     ax.set_xlabel(f"iteration (0 = best of the {n_init} random init points, "
                   f"1+ = one evaluation each)")
     ax.set_ylabel("best f(x) found so far")
-    # The two curves do NOT get equal acquisition search: classical scans an 80x80 grid,
-    # the hybrid only its candidate pool. Say so on the figure, not just in the console.
+    # the two curves don't get equal acquisition search, so put that on the figure
     ax.set_title(f"Hybrid vs classical BO on Branin\n"
                  f"LLM win rate: {llm_win_rate*100:.0f}% (chance baseline {chance*100:.0f}%)"
                  f"  |  caveat: classical searches a 6400-point EI grid,\n"
@@ -268,7 +240,7 @@ if __name__ == "__main__":
 
     llm_win_rate = sum(llm_won_log) / len(llm_won_log) if llm_won_log else 0.0
     n_pool = args.n_candidates + args.n_random_candidates
-    chance = args.n_candidates / n_pool  # LLM only holds this share of the candidate slots
+    chance = args.n_candidates / n_pool  # the LLM's share of the candidate slots
     print(f"\nHybrid best found:    {y_h.min():.4f}")
     print(f"Classical best found: {best_classical[-1]:.4f}")
     print(f"True minimum:         {TRUE_MIN:.4f}")

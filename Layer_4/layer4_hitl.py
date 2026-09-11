@@ -1,34 +1,18 @@
 """
-Layer 4 -- Human-in-the-loop: the Layer 3 hybrid loop, wrapped in LangGraph,
-with a real interrupt() gate before evaluating any candidate the GP is
-genuinely uncertain about.
+Layer 4: the Layer 3 hybrid loop in LangGraph, with an interrupt() gate before
+any experiment the GP is very unsure about.
 
-Why sigma (GP uncertainty) is the gate, not EI or "is this an LLM candidate":
-EI already balances explore/exploit for us -- overriding it because a point
-looks unusual would just be second-guessing math that's already accounting
-for that. Sigma is a different, complementary signal: "how far is this from
-anything we've actually measured." That's the real-world question a human
-running an expensive experiment would ask before committing -- not "is the
-math right" but "are we about to spend budget somewhere we have almost no
-information." Calibrated against this project's actual GP: sigma sits
-around 1 near an already-sampled point and 10-40 at genuinely unexplored
-ones, so UNCERTAINTY_THRESHOLD=20 flags the clearly-unexplored tail without
-flagging routine exploitation.
+The gate is sigma, not EI. EI already trades off explore/exploit, so overriding
+it second-guesses math that has already done the job. Sigma asks a different
+question - how far is this from anything we actually measured - which is what
+you'd want to know before committing real budget. On this GP sigma runs near 1
+next to a measured point and 10-40 out in the open, hence a threshold of 20.
 
-On reject: the risky candidate is dropped and the highest-EI candidate whose
-sigma is already BELOW the threshold is run instead. Substituting a uniform
-random point (the obvious first instinct) is actively wrong here -- a random
-point in a barely-sampled domain is typically MORE uncertain than the one the
-human just vetoed, so the veto would increase the very risk it exists to
-contain. Falling back within the scored pool means "reject" says what a human
-actually means by it: don't gamble, run the best option we already understand.
-Only if no candidate clears the threshold do we resort to a random point.
+Rejecting runs the best candidate already under the threshold. A fresh random
+point, the obvious first idea, is usually MORE uncertain than what was vetoed,
+so the veto would add the very risk it's meant to remove.
 
-Usage:
-    python3 layer4_hitl.py                      # real run, prompts you at each interrupt
-    python3 layer4_hitl.py --dry-run             # no API calls, still prompts for real interrupts
-    python3 layer4_hitl.py --dry-run --auto-approve   # no API calls, no prompts -- for testing the graph itself
-    python3 layer4_hitl.py --dry-run --auto-reject    # same, but always rejects -- tests the fallback path
+--auto-approve / --auto-reject skip the prompts for testing.
 """
 
 import argparse
@@ -37,7 +21,7 @@ import sys
 from pathlib import Path
 from typing import TypedDict
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # BayOAgent/ (project root)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -55,16 +39,15 @@ from Layer_3.layer3_hybrid import (
 load_dotenv()
 
 SEED = 42
-UNCERTAINTY_THRESHOLD = 20.0  # calibrated against this project's GP -- see module docstring
+UNCERTAINTY_THRESHOLD = 20.0  # see module docstring for how this was picked
 N_RANDOM_CANDIDATES = 20
-N_LLM_CANDIDATES = L3_N_CANDIDATES  # whatever Layer 3's proposer defaults to
+N_LLM_CANDIDATES = L3_N_CANDIDATES
 
 _CLIENT = None
 
 
 def get_client():
-    """One client for the whole run -- propose_and_score_node fires once per
-    iteration and rebuilding it each time is pure overhead."""
+    """One client for the whole run; the node fires once per iteration."""
     global _CLIENT
     if _CLIENT is None:
         import groq
@@ -82,7 +65,7 @@ class BOState(TypedDict):
     llm_won_log: list
     approval_log: list
     pending: dict
-    ei_winner_llm: bool  # did an LLM candidate win EI scoring? recorded BEFORE any veto
+    ei_winner_llm: bool  # won EI scoring, recorded before any veto
 
 
 def propose_and_score_node(state: BOState) -> dict:
@@ -112,9 +95,8 @@ def propose_and_score_node(state: BOState) -> dict:
     _, sigma_all = gp.predict(all_candidates, return_std=True)
     sigma = float(sigma_all[best_idx])
 
-    # Best candidate the GP is ALREADY confident about, for the reject path. Picking
-    # it here (rather than sampling a fresh random point at veto time) is what keeps
-    # a rejection from landing somewhere even less explored than what was vetoed.
+    # the reject path's replacement, chosen here so a veto can't land somewhere
+    # even less explored than what it rejected
     safe = [j for j in np.argsort(ei)[::-1] if sigma_all[j] <= UNCERTAINTY_THRESHOLD]
     fallback = None
     if safe:
@@ -153,8 +135,7 @@ def human_review_node(state: BOState) -> dict:
 
     fb = p.get("fallback")
     if fb is None:
-        # Nothing in the pool cleared the threshold -- everything is unexplored, so a
-        # random point is no worse than the alternatives. Rare, and flagged as such.
+        # nothing cleared the threshold, so random is no worse than anything else
         rng = np.random.default_rng(SEED + state["iteration"] + 100_000)
         fallback_x = rng.uniform(BOUNDS[:, 0], BOUNDS[:, 1])
         fb = {"x1": float(fallback_x[0]), "x2": float(fallback_x[1]),
@@ -175,8 +156,8 @@ def evaluate_node(state: BOState) -> dict:
     X = state["X"] + [[p["x1"], p["x2"]]]
     y = state["y"] + [y_new]
     reasoning_log = state["reasoning_log"] + [p["reasoning"]]
-    # the point that WON EI scoring, before any human veto -- vetoing an LLM candidate
-    # is a fact about the human, not evidence the LLM's candidate was worse.
+    # the EI winner, pre-veto: a human rejecting a candidate says nothing about
+    # how good it was
     llm_won_log = state["llm_won_log"] + [state["ei_winner_llm"]]
 
     best_so_far = min(y)
@@ -214,8 +195,8 @@ def build_graph():
 
 
 def run_with_human_in_the_loop(n_init, n_iter, dry_run=False, auto_approve=None, thread_id="layer4-run"):
-    """auto_approve: None -> really prompt via input(). True/False -> skip the
-    prompt and always answer that way (for testing the graph without a live human)."""
+    """auto_approve None prompts via input(); True/False answers that way every
+    time, for testing the graph without a live human."""
     rng = np.random.default_rng(SEED)
     X_init = rng.uniform(BOUNDS[:, 0], BOUNDS[:, 1], size=(n_init, 2))
     y_init = branin(X_init[:, 0], X_init[:, 1])
@@ -254,8 +235,7 @@ def run_with_human_in_the_loop(n_init, n_iter, dry_run=False, auto_approve=None,
 
 
 def make_plot(best_so_far, best_classical, approval_log, n_init, out_path):
-    """Kept separate from the run so a saved results file can be re-plotted without
-    spending API calls (see --replot)."""
+    """Separate from the run so --replot can rebuild it without API calls."""
     n_flagged = len(approval_log)
     n_approved = sum(1 for a in approval_log if a["human_approved"])
 
@@ -264,8 +244,7 @@ def make_plot(best_so_far, best_classical, approval_log, n_init, out_path):
             label="hybrid + HITL", color="tab:purple")
     ax.plot(np.arange(len(best_classical)), best_classical, marker="s",
             label="classical GP + EI (Layer 1)", color="tab:blue")
-    # Label the first of EACH kind -- keying off approval_log[0] alone drops whichever
-    # outcome didn't happen to come first from the legend entirely.
+    # label the first of each kind, or whichever outcome came second drops out
     labelled = set()
     for a in approval_log:
         ok = a["human_approved"]
@@ -275,7 +254,7 @@ def make_plot(best_so_far, best_classical, approval_log, n_init, out_path):
                    label=None if ok in labelled else ("approved" if ok else "rejected"))
         labelled.add(ok)
     ax.axhline(TRUE_MIN, color="gray", linestyle="--", label=f"true global min ({TRUE_MIN:.3f})")
-    # index 0 is the best over ALL n_init random points -- the loop takes over at 1.
+    # index 0 already covers the whole random design
     ax.axvline(0.5, color="black", linestyle=":", alpha=0.5)
     ax.set_xlabel(f"iteration (0 = best of the {n_init} random init points, "
                   f"1+ = one evaluation each)")

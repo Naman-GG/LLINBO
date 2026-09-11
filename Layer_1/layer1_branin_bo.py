@@ -1,17 +1,7 @@
 """
-Layer 1 — Classical Bayesian Optimization on the Branin function.
-
-No BO library (no scikit-optimize, no bayes_opt). We build the two pieces
-that matter by hand:
-  1. Surrogate model  -> sklearn's GaussianProcessRegressor gives us a
-     predicted mean + uncertainty (std) at any point. This part is just
-     curve fitting, not worth reimplementing.
-  2. Acquisition function -> Expected Improvement (EI), written out
-     explicitly below. THIS is the actual "explore vs exploit" decision,
-     and the part worth understanding by hand.
-
-The loop: EI picks the next point -> we "run the experiment" (evaluate
-Branin there) -> refit the GP on all points so far -> repeat.
+Classical BO on Branin: GP surrogate + Expected Improvement, no BO library.
+EI is written out here instead of imported, since that is the piece doing the
+actual explore/exploit work.
 """
 
 from pathlib import Path
@@ -25,14 +15,8 @@ import matplotlib.pyplot as plt
 SEED = 42
 rng = np.random.default_rng(SEED)
 
-# ---------------------------------------------------------------------------
-# 1. The objective function (the thing we're pretending is expensive)
-# ---------------------------------------------------------------------------
-# Branin function: a standard 2D Bayesian-optimization benchmark.
-# Domain: x1 in [-5, 10], x2 in [0, 15]
-# Three known global minima, true minimum value ~= 0.397887
-# We treat it as a black box: the optimizer never sees this formula,
-# only (x, f(x)) pairs it has "measured".
+# Standard 2D BO benchmark. x1 in [-5, 10], x2 in [0, 15], three global minima
+# at 0.397887. The optimizer only ever sees (x, f(x)) pairs, never this formula.
 def branin(x1, x2):
     a, b, c, r, s, t = 1.0, 5.1 / (4 * np.pi**2), 5.0 / np.pi, 6.0, 10.0, 1.0 / (8 * np.pi)
     return a * (x2 - b * x1**2 + c * x1 - r) ** 2 + s * (1 - t) * np.cos(x1) + s
@@ -40,24 +24,12 @@ def branin(x1, x2):
 BOUNDS = np.array([[-5.0, 10.0], [0.0, 15.0]])  # [x1_range, x2_range]
 TRUE_MIN = 0.397887
 
-# ---------------------------------------------------------------------------
-# 2. Expected Improvement, written out explicitly
-# ---------------------------------------------------------------------------
 def expected_improvement(X_candidates, gp, y_best, xi=0.01):
-    """
-    X_candidates: (n, 2) array of points we're considering trying next.
-    gp: fitted GaussianProcessRegressor.
-    y_best: best (lowest, since we're minimizing) objective value seen so far.
-    xi: small exploration bonus - without it EI can get stuck exploiting
-        too early.
-
-    Returns EI(x) for each candidate: the expected amount by which trying
-    this point beats our current best, weighted by how likely that is.
-    """
+    """EI at each candidate. y_best is the lowest value seen so far; xi is a small
+    exploration bonus, without which EI settles into exploiting too early."""
     mu, sigma = gp.predict(X_candidates, return_std=True)
-    sigma = np.maximum(sigma, 1e-9)  # avoid divide-by-zero at already-sampled points
+    sigma = np.maximum(sigma, 1e-9)
 
-    # Minimizing, so "improvement" is how far below y_best we expect to land.
     improvement = y_best - mu - xi
     z = improvement / sigma
 
@@ -65,11 +37,7 @@ def expected_improvement(X_candidates, gp, y_best, xi=0.01):
     ei = np.maximum(ei, 0.0)
     return ei
 
-# ---------------------------------------------------------------------------
-# 3. The BO loop
-# ---------------------------------------------------------------------------
 def run_bo(n_init=5, n_iter=20, grid_res=80):
-    # --- initial random design (Latin-hypercube-ish via simple uniform here) ---
     X = rng.uniform(BOUNDS[:, 0], BOUNDS[:, 1], size=(n_init, 2))
     y = branin(X[:, 0], X[:, 1])
 
@@ -107,9 +75,6 @@ def run_bo(n_init=5, n_iter=20, grid_res=80):
 
     return X, y, np.array(chosen_points), np.array(best_so_far), (g1, g2, G1, G2)
 
-# ---------------------------------------------------------------------------
-# 4. Run it and plot
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     n_init = 5
     X, y, chosen, best_so_far, (g1, g2, G1, G2) = run_bo(n_init=n_init, n_iter=35)
@@ -118,7 +83,6 @@ if __name__ == "__main__":
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
 
-    # --- left: true Branin surface + where we sampled ---
     ax = axes[0]
     cf = ax.contourf(G1, G2, Z_true, levels=40, cmap="viridis")
     fig.colorbar(cf, ax=ax, label="Branin f(x1, x2)")
@@ -134,13 +98,11 @@ if __name__ == "__main__":
     ax.set_title("Where Expected Improvement chose to sample")
     ax.legend(loc="upper right", fontsize=8)
 
-    # --- right: convergence curve ---
     ax = axes[1]
     iters = np.arange(len(best_so_far))
     ax.plot(iters, best_so_far, marker="o", color="tab:blue", label="best value found")
     ax.axhline(TRUE_MIN, color="gray", linestyle="--", label=f"true global min ({TRUE_MIN:.3f})")
-    # index 0 is the best over ALL n_init random points, so EI takes over at index 1 --
-    # not at index n_init (the whole random design collapses into a single point here).
+    # index 0 already covers the whole random design, so EI takes over at 1
     ax.axvline(0.5, color="black", linestyle=":", alpha=0.5)
     ax.text(0.5, ax.get_ylim()[1] * 0.9, " BO starts", fontsize=8, ha="left")
     ax.set_xlabel(f"iteration (0 = best of the {n_init} random init points, 1+ = EI-chosen)")
